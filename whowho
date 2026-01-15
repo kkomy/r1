@@ -7,13 +7,13 @@ from sklearn.model_selection import GroupKFold
 from sklearn.ensemble import HistGradientBoostingClassifier
 
 
-# ----------------------------
-# label: "ab/cd", "a/b/cd", "a/b/c/d", "abcd"
-# -> mask(0..7), cuts at positions 1,2,3
-# ----------------------------
+# -------------------------------
+# label: only "/" format
+# ex) "ab/cd", "a/b/cd", "a/b/c/d", "abcd"
+# -------------------------------
 def label_to_mask_len4(label: str) -> int:
-    parts = label.strip().split("/")
-    lens = [len(p) for p in parts if p != ""]
+    parts = [p for p in label.strip().split("/") if p != ""]
+    lens = [len(p) for p in parts]
     if sum(lens) != 4 or any(l <= 0 for l in lens):
         raise ValueError(f"bad label: {label}")
 
@@ -28,19 +28,29 @@ def label_to_mask_len4(label: str) -> int:
     return (b1 << 2) | (b2 << 1) | b3
 
 
-def mask_to_segments(token: str, mask: int):
+# -------------------------------
+# helpers: cuts / segments
+# -------------------------------
+def mask_to_cuts(mask: int):
     cuts = []
     if (mask >> 2) & 1: cuts.append(1)
     if (mask >> 1) & 1: cuts.append(2)
     if (mask >> 0) & 1: cuts.append(3)
+    return cuts
+
+def mask_to_segments(token4: str, mask: int):
+    cuts = mask_to_cuts(mask)
     out, prev = [], 0
     for c in cuts:
-        out.append(token[prev:c]); prev = c
-    out.append(token[prev:4])
+        out.append(token4[prev:c]); prev = c
+    out.append(token4[prev:4])
     return out
 
 
-def H(counter: Counter) -> float:
+# -------------------------------
+# distribution stats
+# -------------------------------
+def entropy(counter: Counter) -> float:
     n = sum(counter.values())
     if n == 0: return 0.0
     ent = 0.0
@@ -49,15 +59,13 @@ def H(counter: Counter) -> float:
         ent -= p * math.log(p + 1e-12)
     return ent
 
-
-def var_prob(counter: Counter) -> float:
+def prob_variance(counter: Counter) -> float:
     n = sum(counter.values())
     if n == 0: return 0.0
-    ps = np.array([c / n for c in counter.values()], float)
+    ps = np.array([c / n for c in counter.values()], dtype=float)
     return float((ps**2).mean() - ps.mean()**2)
 
-
-def mi_pairs(pairs) -> float:
+def mi_from_pairs(pairs) -> float:
     joint = Counter(pairs)
     n = sum(joint.values())
     if n == 0: return 0.0
@@ -73,60 +81,130 @@ def mi_pairs(pairs) -> float:
     return mi
 
 
-def featurize(tokens4, mask: int):
+# -------------------------------
+# n-gram extraction (len4 token)
+# -------------------------------
+def ngrams_of_token(token4: str, n: int):
+    # token length is 4
+    return [token4[i:i+n] for i in range(0, 4 - n + 1)]
+
+def classify_ngram_by_cuts(start: int, end: int, cuts):
+    """
+    ngram covers indices [start, end) in 0..4
+    internal if it does NOT cross any cut position
+    cross if it crosses at least one cut
+    cuts are positions in 1..3
+    """
+    # it crosses cut c if start < c < end
+    for c in cuts:
+        if start < c < end:
+            return "cross"
+    return "internal"
+
+
+# -------------------------------
+# feature: long tokens + candidate mask
+#   A) segment-position distributions (entropy/var)
+#   B) internal vs cross n-gram distributions (n=2,3)
+# -------------------------------
+def featurize_long(tokens4, mask: int):
+    cuts = mask_to_cuts(mask)
+
+    # ---- A) segment-position distributions
     segs_all = [mask_to_segments(t, mask) for t in tokens4]
     m = len(segs_all[0])  # 1~4
-
     pos_cnt = [Counter() for _ in range(m)]
     for segs in segs_all:
         for i, s in enumerate(segs):
             pos_cnt[i][s] += 1
+    ent_pos = [entropy(c) for c in pos_cnt]
+    var_pos = [prob_variance(c) for c in pos_cnt]
 
-    ent = [H(c) for c in pos_cnt]
-    var = [var_prob(c) for c in pos_cnt]
-
-    # 인접 세그먼트 MI 평균
-    mi = 0.0
+    # MI between adjacent segment positions (mean)
+    mi_mean = 0.0
     if m >= 2:
-        mi = float(np.mean([mi_pairs([(segs[i], segs[i+1]) for segs in segs_all]) for i in range(m-1)]))
+        mi_vals = []
+        for i in range(m - 1):
+            pairs = [(segs[i], segs[i+1]) for segs in segs_all]
+            mi_vals.append(mi_from_pairs(pairs))
+        mi_mean = float(np.mean(mi_vals))
+
+    # ---- B) internal vs cross n-gram distributions
+    def ngram_stats(n: int):
+        internal = Counter()
+        cross = Counter()
+        for t in tokens4:
+            for i in range(0, 4 - n + 1):
+                g = t[i:i+n]
+                tag = classify_ngram_by_cuts(i, i+n, cuts)
+                if tag == "internal":
+                    internal[g] += 1
+                else:
+                    cross[g] += 1
+
+        ent_in = entropy(internal)
+        ent_cross = entropy(cross)
+        var_in = prob_variance(internal)
+        var_cross = prob_variance(cross)
+
+        # gap: cross - internal (경계가 구조를 깨면 보통 ent_cross ↑, var_cross ↓ 경향)
+        return {
+            f"ent_in_{n}": ent_in,
+            f"ent_cross_{n}": ent_cross,
+            f"ent_gap_{n}": ent_cross - ent_in,
+            f"var_in_{n}": var_in,
+            f"var_cross_{n}": var_cross,
+            f"var_gap_{n}": var_in - var_cross,  # 내부가 더 쏠리면(+)
+        }
+
+    stats2 = ngram_stats(2)
+    stats3 = ngram_stats(3)
 
     return {
         "mask": mask,
-        "b1": (mask >> 2) & 1, "b2": (mask >> 1) & 1, "b3": (mask >> 0) & 1,
+        "b1": (mask >> 2) & 1,
+        "b2": (mask >> 1) & 1,
+        "b3": (mask >> 0) & 1,
         "num_segs": m,
-        "ent_sum": float(sum(ent)),
-        "var_sum": float(sum(var)),
-        "mi_mean": mi,
+        "ent_sum": float(sum(ent_pos)),
+        "var_sum": float(sum(var_pos)),
+        "mi_mean": mi_mean,
         "n_tokens": len(tokens4),
+        **stats2,
+        **stats3,
     }
 
 
-def load_folder(folder="ct_data"):
-    msgs, y = [], []
+# -------------------------------
+# load: line1 tokens, line2 label
+# -------------------------------
+def load_ct_data(folder="ct_data"):
+    long_msgs, y_masks = [], []
     for fn in sorted(os.listdir(folder)):
-        if not fn.endswith(".txt"): 
+        if not fn.endswith(".txt"):
             continue
         path = os.path.join(folder, fn)
         with open(path, "r", encoding="utf-8") as f:
             line1 = f.readline().strip()
             line2 = f.readline().strip()
 
-        tokens = [t for t in line1.split() if len(t) == 4]
-        if not tokens:
+        tokens4 = [t for t in line1.split() if len(t) == 4]
+        if not tokens4:
             continue
 
-        mask = label_to_mask_len4(line2)
-        msgs.append(tokens)
-        y.append(mask)
-    return msgs, y
+        y_mask = label_to_mask_len4(line2)
+        long_msgs.append(tokens4)
+        y_masks.append(y_mask)
+
+    return long_msgs, y_masks
 
 
-def build_df(long_tokens_list, y_masks):
+def build_df(long_msgs, y_masks):
     rows = []
-    for gid, (tokens4, y_mask) in enumerate(zip(long_tokens_list, y_masks)):
+    for gid, (tokens4, y_true) in enumerate(zip(long_msgs, y_masks)):
         for mask in range(8):
-            r = featurize(tokens4, mask)
-            r.update({"group_id": gid, "y_true": y_mask})
+            r = featurize_long(tokens4, mask)
+            r.update({"group_id": gid, "y_true": y_true})
             rows.append(r)
     return pd.DataFrame(rows)
 
@@ -134,34 +212,53 @@ def build_df(long_tokens_list, y_masks):
 def top1_acc(df, scores):
     tmp = df[["group_id", "mask", "y_true"]].copy()
     tmp["score"] = scores
-    chosen = tmp.sort_values(["group_id", "score"], ascending=[True, False]).groupby("group_id").head(1)
+    chosen = (
+        tmp.sort_values(["group_id", "score"], ascending=[True, False])
+           .groupby("group_id")
+           .head(1)
+    )
     return float((chosen["mask"] == chosen["y_true"]).mean())
 
 
 def main():
-    long_msgs, y_masks = load_folder("ct_data")
-    print("loaded files(len4 tokens):", len(long_msgs))
+    long_msgs, y_masks = load_ct_data("ct_data")
+    print("loaded files:", len(long_msgs))
 
     df = build_df(long_msgs, y_masks)
-    feat = ["b1","b2","b3","num_segs","ent_sum","var_sum","mi_mean","n_tokens"]
 
-    X = df[feat].to_numpy()
+    feat_cols = [
+        "b1","b2","b3","num_segs",
+        "ent_sum","var_sum","mi_mean","n_tokens",
+        "ent_in_2","ent_cross_2","ent_gap_2","var_in_2","var_cross_2","var_gap_2",
+        "ent_in_3","ent_cross_3","ent_gap_3","var_in_3","var_cross_3","var_gap_3",
+    ]
+
+    X = df[feat_cols].to_numpy()
+    y = df["y_true"].to_numpy()       # 멀티클래스(0..7), 후보행마다 동일
     groups = df["group_id"].to_numpy()
-    y = df["y_true"].to_numpy()  # 멀티클래스(0..7), 후보행마다 동일
 
-    model = HistGradientBoostingClassifier(max_depth=3, learning_rate=0.05, max_iter=600, random_state=42)
+    model = HistGradientBoostingClassifier(
+        max_depth=3,
+        learning_rate=0.05,
+        max_iter=700,
+        random_state=42
+    )
+
     gkf = GroupKFold(n_splits=5)
-
     accs = []
-    for i, (tr, te) in enumerate(gkf.split(X, y, groups), 1):
+    for fold, (tr, te) in enumerate(gkf.split(X, y, groups), 1):
         model.fit(X[tr], y[tr])
+
         proba = model.predict_proba(X[te])  # (rows, 8)
         te_df = df.iloc[te]
         masks = te_df["mask"].to_numpy()
-        scores = proba[np.arange(len(te_df)), masks]  # 후보 mask 확률을 점수로
+
+        # 각 후보 row에서 "그 후보 mask 클래스 확률"을 점수로 사용
+        scores = proba[np.arange(len(te_df)), masks]
+
         acc = top1_acc(te_df, scores)
         accs.append(acc)
-        print(f"fold {i}: top1={acc:.4f}")
+        print(f"fold {fold}: top1={acc:.4f}")
 
     print("mean top1:", float(np.mean(accs)))
 
